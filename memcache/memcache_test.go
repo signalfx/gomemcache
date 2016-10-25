@@ -19,12 +19,14 @@ package memcache
 
 import (
 	"fmt"
+	"github.com/stretchr/testify/assert"
 	"net"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
 	"time"
+	"bytes"
 )
 
 const testServer = "localhost:11211"
@@ -34,8 +36,14 @@ func setup(t *testing.T) bool {
 	if err != nil {
 		t.Skipf("skipping test; no server running at %s", testServer)
 	}
-	c.Write([]byte("flush_all\r\n"))
-	c.Close()
+	_, err = c.Write([]byte("flush_all\r\n"))
+	if err != nil {
+		t.Skipf("skipping test; error writing to server at %s", testServer)
+	}
+	err = c.Close()
+	if err != nil {
+		t.Skipf("skipping test; error closing write to server at %s", testServer)
+	}
 	return true
 }
 
@@ -46,6 +54,13 @@ func TestLocalhost(t *testing.T) {
 	testWithClient(t, New(testServer))
 }
 
+func TestBinary(t *testing.T) {
+	if !setup(t) {
+		return
+	}
+	testBinary(t, New(testServer))
+}
+
 // Run the memcached binary as a child process and connect to its unix socket.
 func TestUnixSocket(t *testing.T) {
 	sock := fmt.Sprintf("/tmp/test-gomemcache-%d.sock", os.Getpid())
@@ -54,8 +69,6 @@ func TestUnixSocket(t *testing.T) {
 		t.Skipf("skipping test; couldn't find memcached")
 		return
 	}
-	defer cmd.Wait()
-	defer cmd.Process.Kill()
 
 	// Wait a bit for the socket to appear.
 	for i := 0; i < 10; i++ {
@@ -66,6 +79,8 @@ func TestUnixSocket(t *testing.T) {
 	}
 
 	testWithClient(t, New(sock))
+	assert.NoError(t, cmd.Process.Kill())
+	assert.Error(t, cmd.Wait())
 }
 
 func mustSetF(t *testing.T, c *Client) func(*Item) {
@@ -76,24 +91,16 @@ func mustSetF(t *testing.T, c *Client) func(*Item) {
 	}
 }
 
-func testWithClient(t *testing.T, c *Client) {
-	checkErr := func(err error, format string, args ...interface{}) {
-		if err != nil {
-			t.Fatalf(format, args...)
-		}
-	}
-	mustSet := mustSetF(t, c)
-
+func doSetGetAdd(t *testing.T, c *Client) {
 	// Set
 	foo := &Item{Key: "foo", Value: []byte("fooval"), Flags: 123}
 	err := c.Set(foo)
-	checkErr(err, "first set(foo): %v", err)
+	checkErr(t, err, "first set(foo): %v", err)
 	err = c.Set(foo)
-	checkErr(err, "second set(foo): %v", err)
-
+	checkErr(t, err, "second set(foo): %v", err)
 	// Get
 	it, err := c.Get("foo")
-	checkErr(err, "get(foo): %v", err)
+	checkErr(t, err, "get(foo): %v", err)
 	if it.Key != "foo" {
 		t.Errorf("get(foo) Key = %q, want foo", it.Key)
 	}
@@ -103,26 +110,26 @@ func testWithClient(t *testing.T, c *Client) {
 	if it.Flags != 123 {
 		t.Errorf("get(foo) Flags = %v, want 123", it.Flags)
 	}
-
 	// Add
 	bar := &Item{Key: "bar", Value: []byte("barval")}
 	err = c.Add(bar)
-	checkErr(err, "first add(foo): %v", err)
-	if err := c.Add(bar); err != ErrNotStored {
+	checkErr(t, err, "first add(foo): %v", err)
+	if err = c.Add(bar); err != ErrNotStored {
 		t.Fatalf("second add(foo) want ErrNotStored, got %v", err)
 	}
-
 	// Replace
 	baz := &Item{Key: "baz", Value: []byte("bazvalue")}
-	if err := c.Replace(baz); err != ErrNotStored {
+	if err = c.Replace(baz); err != ErrNotStored {
 		t.Fatalf("expected replace(baz) to return ErrNotStored, got %v", err)
 	}
 	err = c.Replace(bar)
-	checkErr(err, "replaced(foo): %v", err)
+	checkErr(t, err, "replaced(foo): %v", err)
+}
 
+func doGetMultiDelete(t *testing.T, c *Client) {
 	// GetMulti
 	m, err := c.GetMulti([]string{"foo", "bar"})
-	checkErr(err, "GetMulti: %v", err)
+	checkErr(t, err, "GetMulti: %v", err)
 	if g, e := len(m), 2; g != e {
 		t.Errorf("GetMulti: got len(map) = %d, want = %d", g, e)
 	}
@@ -141,45 +148,100 @@ func testWithClient(t *testing.T, c *Client) {
 
 	// Delete
 	err = c.Delete("foo")
-	checkErr(err, "Delete: %v", err)
-	it, err = c.Get("foo")
+	checkErr(t, err, "Delete: %v", err)
+	_, err = c.Get("foo")
 	if err != ErrCacheMiss {
 		t.Errorf("post-Delete want ErrCacheMiss, got %v", err)
 	}
 
+}
+
+func doIncrDecr(t *testing.T, c *Client) {
+	mustSet := mustSetF(t, c)
 	// Incr/Decr
 	mustSet(&Item{Key: "num", Value: []byte("42")})
 	n, err := c.Increment("num", 8)
-	checkErr(err, "Increment num + 8: %v", err)
+	checkErr(t, err, "Increment num + 8: %v", err)
 	if n != 50 {
 		t.Fatalf("Increment num + 8: want=50, got=%d", n)
 	}
 	n, err = c.Decrement("num", 49)
-	checkErr(err, "Decrement: %v", err)
+	checkErr(t, err, "Decrement: %v", err)
 	if n != 1 {
 		t.Fatalf("Decrement 49: want=1, got=%d", n)
 	}
 	err = c.Delete("num")
-	checkErr(err, "delete num: %v", err)
-	n, err = c.Increment("num", 1)
+	checkErr(t, err, "delete num: %v", err)
+	_, err = c.Increment("num", 1)
 	if err != ErrCacheMiss {
 		t.Fatalf("increment post-delete: want ErrCacheMiss, got %v", err)
 	}
 	mustSet(&Item{Key: "num", Value: []byte("not-numeric")})
-	n, err = c.Increment("num", 1)
+	_, err = c.Increment("num", 1)
 	if err == nil || !strings.Contains(err.Error(), "client error") {
 		t.Fatalf("increment non-number: want client error, got %v", err)
 	}
-	testTouchWithClient(t, c)
-
 	// Test Delete All
 	err = c.DeleteAll()
-	checkErr(err, "DeleteAll: %v", err)
-	it, err = c.Get("bar")
+	checkErr(t, err, "DeleteAll: %v", err)
+	_, err = c.Get("bar")
 	if err != ErrCacheMiss {
 		t.Errorf("post-DeleteAll want ErrCacheMiss, got %v", err)
 	}
+}
+func checkErr(t *testing.T, err error, format string, args ...interface{}) {
+	if err != nil {
+		t.Fatalf(format, args...)
+	}
+}
 
+func testWithClient(t *testing.T, c *Client) {
+	doSetGetAdd(t, c)
+	doGetMultiDelete(t, c)
+	doIncrDecr(t, c)
+
+	testTouchWithClient(t, c)
+
+}
+
+func testBinary(t *testing.T, c *Client) {
+	testCases := []struct {
+		key   string
+		value []byte
+		pass  bool
+	}{
+		{"can haz spaces", []byte("yay spaces"), true},
+		{strings.Repeat("a", 251), []byte("nope"), false},
+		{"nospaces", []byte("yaynospaces"), true},
+		{"largepayload", bytes.Repeat([]byte{0xff}, 80000), true},
+	}
+	c.Binary = true
+	c.Timeout = time.Second
+	for _, tc := range testCases {
+		i := &Item{Key: tc.key, Value: tc.value}
+		err := c.Set(i)
+		if tc.pass {
+			assert.NoError(t, err)
+			resp, err2 := c.Get(tc.key)
+			assert.NoError(t, err2)
+			assert.Equal(t, tc.value, resp.Value)
+		} else {
+			assert.Error(t, err)
+		}
+	}
+	i := &Item{Key: "key", Value: []byte("value")}
+	err := c.Add(i)
+	assert.Equal(t, ErrUnsupported, err)
+	_, err = c.GetMulti([]string{})
+	assert.Equal(t, ErrUnsupported, err)
+	err = c.Delete("key")
+	assert.Equal(t, ErrUnsupported, err)
+	err = c.DeleteAll()
+	assert.Equal(t, ErrUnsupported, err)
+	_, err = c.Increment("key", uint64(1))
+	assert.Equal(t, ErrUnsupported, err)
+	_, err = c.Decrement("key", uint64(1))
+	assert.Equal(t, ErrUnsupported, err)
 }
 
 func testTouchWithClient(t *testing.T, c *Client) {
@@ -221,7 +283,7 @@ func testTouchWithClient(t *testing.T, c *Client) {
 
 	_, err = c.Get("bar")
 	if nil == err {
-		t.Fatalf("item bar did not expire within %v seconds", time.Now().Sub(setTime).Seconds())
+		t.Fatalf("item bar did not expire within %v seconds", time.Since(setTime).Seconds())
 	} else {
 		if err != ErrCacheMiss {
 			t.Fatalf("unexpected error retrieving bar: %v", err.Error())
