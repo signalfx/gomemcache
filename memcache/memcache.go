@@ -197,7 +197,7 @@ func New(server ...string) *Client {
 	ss := new(ServerList)
 	err := ss.SetServers(server...)
 	if err != nil {
-		panic("Unable to set servers")
+		panic("Unable to set servers: " + err.Error())
 	}
 	return NewFromSelector(ss)
 }
