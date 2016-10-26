@@ -26,11 +26,56 @@ import (
 	"io/ioutil"
 	"net"
 
+	"encoding/binary"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+const (
+	headerSize = 24
+
+	// magic
+	reqMagic = byte(0x80)
+	resMagic = byte(0x81)
+
+	// ops
+	opGet     = byte(0x00)
+	opSet     = byte(0x01)
+	opAdd     = byte(0x02)
+	opReplace = byte(0x03)
+
+	// statuses
+	statusSuccess        = uint16(0x00)
+	statusKeyEnoent      = uint16(0x01)
+	statusKeyExists      = uint16(0x02)
+	statusE2Big          = uint16(0x03)
+	statusEinval         = uint16(0x04)
+	statusNotStored      = uint16(0x05)
+	statusDeltaBadVal    = uint16(0x06)
+	statusNotMyVBucket   = uint16(0x07)
+	statusUnknownCommand = uint16(0x81)
+	statusEnomem         = uint16(0x82)
+	statusTmpFail        = uint16(0x86)
+)
+
+var statusNames map[uint16]string
+
+func init() {
+	statusNames = make(map[uint16]string)
+	statusNames[statusSuccess] = "SUCCESS"
+	statusNames[statusKeyEnoent] = "KEY_ENOENT"
+	statusNames[statusKeyExists] = "KEY_EEXISTS"
+	statusNames[statusE2Big] = "E2BIG"
+	statusNames[statusEinval] = "EINVAL"
+	statusNames[statusNotStored] = "NOT_STORED"
+	statusNames[statusDeltaBadVal] = "DELTA_BADVAL"
+	statusNames[statusNotMyVBucket] = "NOT_MY_VBUCKET"
+	statusNames[statusUnknownCommand] = "UNKNOWN_COMMAND"
+	statusNames[statusEnomem] = "ENOMEM"
+	statusNames[statusTmpFail] = "TMPFAIL"
+}
 
 // Similar to:
 // http://code.google.com/appengine/docs/go/memcache/reference.html
@@ -49,20 +94,49 @@ var (
 	// CompareAndSwap) failed because the condition was not satisfied.
 	ErrNotStored = errors.New("memcache: item not stored")
 
-	// ErrServer means that a server error occurred.
+	// ErrServerError means that a server error occurred.
 	ErrServerError = errors.New("memcache: server error")
 
 	// ErrNoStats means that no statistics were available.
 	ErrNoStats = errors.New("memcache: no statistics available")
 
 	// ErrMalformedKey is returned when an invalid key is used.
-	// Keys must be at maximum 250 bytes long, ASCII, and not
-	// contain whitespace or control characters.
+	// Keys must be at maximum 250 bytes long.
+	// If ASCII cannot contain whitespace or control characters.
 	ErrMalformedKey = errors.New("malformed: key is too long or contains invalid characters")
 
 	// ErrNoServers is returned when no servers are configured or available.
 	ErrNoServers = errors.New("memcache: no servers configured or available")
+
+	// ErrWrongMagic is returned if the server returns the incorrect magic
+	ErrWrongMagic = errors.New("memcache: wrong magic")
+
+	// ErrWrongOp is returned if the server returns a response for the incorrect operation
+	ErrWrongOp = errors.New("memcache: wrong op")
+
+	// ErrMissingCas is returned if a cas is required, but isn't supplied
+	ErrMissingCas = errors.New("memcache: response should contain casid")
+
+	// ErrExtrasPresent is returned if extras are present when they are required not to be
+	ErrExtrasPresent = errors.New("memcache: extras present")
+
+	// ErrKeyPresent is returned if key is present when it should't be
+	ErrKeyPresent = errors.New("memcache: key present")
+
+	// ErrValuePresent is returned if value is present when it should't be
+	ErrValuePresent = errors.New("memcache: value present")
+
+	// ErrUnsupported is returned if a method is called with a binary client that hasn't been implemented yet
+	ErrUnsupported = errors.New("memcache: the binary version of this method hasn't been implemented yet")
 )
+
+type errBadStatus struct {
+	op uint16
+}
+
+func (e *errBadStatus) Error() string {
+	return "Bad status in response: " + statusNames[e.op]
+}
 
 // DefaultTimeout is the default socket read/write timeout.
 const DefaultTimeout = 100 * time.Millisecond
@@ -71,6 +145,8 @@ const (
 	buffered            = 8 // arbitrary buffered channel size, for readability
 	maxIdleConnsPerAddr = 2 // TODO(bradfitz): make this configurable?
 )
+
+type doer func(*conn, *Item) (*Item, error)
 
 // resumableError returns true if err is only a protocol-level cache error.
 // This is used to determine whether or not a server connection should
@@ -84,13 +160,15 @@ func resumableError(err error) bool {
 	return false
 }
 
-func legalKey(key string) bool {
+func (c *Client) legalKey(key string) bool {
 	if len(key) > 250 {
 		return false
 	}
-	for i := 0; i < len(key); i++ {
-		if key[i] <= ' ' || key[i] > 0x7e {
-			return false
+	if !c.Binary {
+		for i := 0; i < len(key); i++ {
+			if key[i] <= ' ' || key[i] > 0x7e {
+				return false
+			}
 		}
 	}
 	return true
@@ -117,7 +195,10 @@ var (
 // it gets a proportional amount of weight.
 func New(server ...string) *Client {
 	ss := new(ServerList)
-	ss.SetServers(server...)
+	err := ss.SetServers(server...)
+	if err != nil {
+		panic("Unable to set servers")
+	}
 	return NewFromSelector(ss)
 }
 
@@ -132,11 +213,41 @@ type Client struct {
 	// Timeout specifies the socket read/write timeout.
 	// If zero, DefaultTimeout is used.
 	Timeout time.Duration
+	// determines which protocol is used, binary or plaintext
+	Binary bool
 
 	selector ServerSelector
 
 	lk       sync.Mutex
 	freeconn map[string][]*conn
+}
+
+// TODO implement the rest as we add ops
+func (i *Item) validateResponse(op byte) error {
+	switch op {
+	case opSet:
+		fallthrough
+	case opAdd:
+		fallthrough
+	case opReplace:
+		// MUST have CAS
+		if i.casid == uint64(0) {
+			return ErrMissingCas
+		}
+		// MUST not have extras
+		if i.extras != nil || len(i.extras) > 0 {
+			return ErrExtrasPresent
+		}
+		// MUST not have key
+		if len(i.Key) > 0 {
+			return ErrKeyPresent
+		}
+		// MUST not have key
+		if i.Value != nil || len(i.Value) > 0 {
+			return ErrValuePresent
+		}
+	}
+	return nil
 }
 
 // Item is an item to be got or stored in a memcached server.
@@ -158,6 +269,12 @@ type Item struct {
 
 	// Compare and swap ID.
 	casid uint64
+
+	// opaque
+	opaque uint32
+
+	// extras
+	extras []byte
 }
 
 // conn is a connection to a server.
@@ -173,8 +290,8 @@ func (cn *conn) release() {
 	cn.c.putFreeConn(cn.addr, cn)
 }
 
-func (cn *conn) extendDeadline() {
-	cn.nc.SetDeadline(time.Now().Add(cn.c.netTimeout()))
+func (cn *conn) extendDeadline() error {
+	return cn.nc.SetDeadline(time.Now().Add(cn.c.netTimeout()))
 }
 
 // condRelease releases this connection if the error pointed to by err
@@ -185,11 +302,11 @@ func (cn *conn) condRelease(err *error) {
 	if *err == nil || resumableError(*err) {
 		cn.release()
 	} else {
-		cn.nc.Close()
+		_ = cn.nc.Close()
 	}
 }
 
-func (c *Client) putFreeConn(addr net.Addr, cn *conn) {
+func (c *Client) putFreeConn(addr fmt.Stringer, cn *conn) {
 	c.lk.Lock()
 	defer c.lk.Unlock()
 	if c.freeconn == nil {
@@ -197,13 +314,13 @@ func (c *Client) putFreeConn(addr net.Addr, cn *conn) {
 	}
 	freelist := c.freeconn[addr.String()]
 	if len(freelist) >= maxIdleConnsPerAddr {
-		cn.nc.Close()
+		_ = cn.nc.Close()
 		return
 	}
 	c.freeconn[addr.String()] = append(freelist, cn)
 }
 
-func (c *Client) getFreeConn(addr net.Addr) (cn *conn, ok bool) {
+func (c *Client) getFreeConn(addr fmt.Stringer) (cn *conn, ok bool) {
 	c.lk.Lock()
 	defer c.lk.Unlock()
 	if c.freeconn == nil {
@@ -237,11 +354,6 @@ func (cte *ConnectTimeoutError) Error() string {
 }
 
 func (c *Client) dial(addr net.Addr) (net.Conn, error) {
-	type connError struct {
-		cn  net.Conn
-		err error
-	}
-
 	nc, err := net.DialTimeout(addr.Network(), addr.String(), c.netTimeout())
 	if err == nil {
 		return nc, nil
@@ -257,7 +369,10 @@ func (c *Client) dial(addr net.Addr) (net.Conn, error) {
 func (c *Client) getConn(addr net.Addr) (*conn, error) {
 	cn, ok := c.getFreeConn(addr)
 	if ok {
-		cn.extendDeadline()
+		err := cn.extendDeadline()
+		if err != nil {
+			return nil, err
+		}
 		return cn, nil
 	}
 	nc, err := c.dial(addr)
@@ -270,26 +385,32 @@ func (c *Client) getConn(addr net.Addr) (*conn, error) {
 		rw:   bufio.NewReadWriter(bufio.NewReader(nc), bufio.NewWriter(nc)),
 		c:    c,
 	}
-	cn.extendDeadline()
+	err = cn.extendDeadline()
+	if err != nil {
+		return nil, err
+	}
 	return cn, nil
 }
 
-func (c *Client) onItem(item *Item, fn func(*Client, *bufio.ReadWriter, *Item) error) error {
+func (c *Client) noItemOnItem(item *Item, fn doer) error {
+	_, err := c.onItem(item, fn)
+	return err
+}
+
+func (c *Client) onItem(item *Item, fn doer) (*Item, error) {
 	addr, err := c.selector.PickServer(item.Key)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	cn, err := c.getConn(addr)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer cn.condRelease(&err)
-	if err = fn(c, cn.rw, item); err != nil {
-		return err
-	}
-	return nil
+	return fn(cn, item)
 }
 
+// FlushAll flushes each selector
 func (c *Client) FlushAll() error {
 	return c.selector.Each(c.flushAllFromAddr)
 }
@@ -297,13 +418,26 @@ func (c *Client) FlushAll() error {
 // Get gets the item for the given key. ErrCacheMiss is returned for a
 // memcache cache miss. The key must be at most 250 bytes in length.
 func (c *Client) Get(key string) (item *Item, err error) {
+	if c.Binary {
+		return c.onItem(&Item{Key: key}, c.get)
+	}
 	err = c.withKeyAddr(key, func(addr net.Addr) error {
-		return c.getFromAddr(addr, []string{key}, func(it *Item) { item = it })
+		return c.getFromAddr(addr, []string{key}, func(it *Item) {
+			item = it
+		})
 	})
 	if err == nil && item == nil {
 		err = ErrCacheMiss
 	}
 	return
+}
+
+// only callable as binary
+func (c *Client) get(cn *conn, item *Item) (*Item, error) {
+	if !c.Binary {
+		panic("Only binary mode allowewd here!")
+	}
+	return c.binaryPopulate(cn.nc, opGet, item)
 }
 
 // Touch updates the expiry for the given key. The seconds parameter is either
@@ -317,7 +451,7 @@ func (c *Client) Touch(key string, seconds int32) (err error) {
 }
 
 func (c *Client) withKeyAddr(key string, fn func(net.Addr) error) (err error) {
-	if !legalKey(key) {
+	if !c.legalKey(key) {
 		return ErrMalformedKey
 	}
 	addr, err := c.selector.PickServer(key)
@@ -337,6 +471,9 @@ func (c *Client) withAddrRw(addr net.Addr, fn func(*bufio.ReadWriter) error) (er
 }
 
 func (c *Client) withKeyRw(key string, fn func(*bufio.ReadWriter) error) error {
+	if c.Binary {
+		return ErrUnsupported
+	}
 	return c.withKeyAddr(key, func(addr net.Addr) error {
 		return c.withAddrRw(addr, fn)
 	})
@@ -411,6 +548,9 @@ func (c *Client) touchFromAddr(addr net.Addr, keys []string, expiration int32) e
 // cache misses. Each key must be at most 250 bytes in length.
 // If no error is returned, the returned map will also be non-nil.
 func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
+	if c.Binary {
+		return nil, ErrUnsupported
+	}
 	var lk sync.Mutex
 	m := make(map[string]*Item)
 	addItemToMap := func(it *Item) {
@@ -421,7 +561,7 @@ func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
 
 	keyMap := make(map[net.Addr][]string)
 	for _, key := range keys {
-		if !legalKey(key) {
+		if !c.legalKey(key) {
 			return nil, ErrMalformedKey
 		}
 		addr, err := c.selector.PickServer(key)
@@ -439,7 +579,7 @@ func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
 	}
 
 	var err error
-	for _ = range keyMap {
+	for range keyMap {
 		if ge := <-ch; ge != nil {
 			err = ge
 		}
@@ -493,31 +633,40 @@ func scanGetResponseLine(line []byte, it *Item) (size int, err error) {
 
 // Set writes the given item, unconditionally.
 func (c *Client) Set(item *Item) error {
-	return c.onItem(item, (*Client).set)
+	return c.noItemOnItem(item, c.set)
 }
 
-func (c *Client) set(rw *bufio.ReadWriter, item *Item) error {
-	return c.populateOne(rw, "set", item)
+func (c *Client) set(cn *conn, item *Item) (*Item, error) {
+	if c.Binary {
+		return c.binaryPopulate(cn.nc, opSet, item)
+	}
+	return nil, c.populateOne(cn.rw, "set", item)
 }
 
 // Add writes the given item, if no value already exists for its
 // key. ErrNotStored is returned if that condition is not met.
 func (c *Client) Add(item *Item) error {
-	return c.onItem(item, (*Client).add)
+	return c.noItemOnItem(item, c.add)
 }
 
-func (c *Client) add(rw *bufio.ReadWriter, item *Item) error {
-	return c.populateOne(rw, "add", item)
+func (c *Client) add(cn *conn, item *Item) (*Item, error) {
+	if c.Binary {
+		return nil, ErrUnsupported
+	}
+	return nil, c.populateOne(cn.rw, "add", item)
 }
 
 // Replace writes the given item, but only if the server *does*
 // already hold data for this key
 func (c *Client) Replace(item *Item) error {
-	return c.onItem(item, (*Client).replace)
+	return c.noItemOnItem(item, c.replace)
 }
 
-func (c *Client) replace(rw *bufio.ReadWriter, item *Item) error {
-	return c.populateOne(rw, "replace", item)
+func (c *Client) replace(cn *conn, item *Item) (*Item, error) {
+	if c.Binary {
+		return nil, ErrUnsupported
+	}
+	return nil, c.populateOne(cn.rw, "replace", item)
 }
 
 // CompareAndSwap writes the given item that was previously returned
@@ -528,17 +677,152 @@ func (c *Client) replace(rw *bufio.ReadWriter, item *Item) error {
 // calls. ErrNotStored is returned if the value was evicted in between
 // the calls.
 func (c *Client) CompareAndSwap(item *Item) error {
-	return c.onItem(item, (*Client).cas)
+	return c.noItemOnItem(item, c.cas)
 }
 
-func (c *Client) cas(rw *bufio.ReadWriter, item *Item) error {
-	return c.populateOne(rw, "cas", item)
-}
-
-func (c *Client) populateOne(rw *bufio.ReadWriter, verb string, item *Item) error {
-	if !legalKey(item.Key) {
-		return ErrMalformedKey
+func (c *Client) cas(cn *conn, item *Item) (*Item, error) {
+	if c.Binary {
+		return nil, ErrUnsupported
 	}
+	return nil, c.populateOne(cn.rw, "cas", item)
+}
+
+// TODO finish more than SET and GET
+// TODO maybe use an arena for the body buff
+func binaryRequest(b *bytes.Buffer, op byte, item *Item) (*bytes.Buffer, error) {
+	b.Reset()
+	var extraLength byte
+	switch op {
+	case opSet:
+		extraLength = 8
+	case opGet:
+		extraLength = 0
+	default:
+		panic("unsupported operation")
+	}
+	errs := make([]error, 0)
+	totalBody := uint32(int(extraLength) + len(item.Key) + len(item.Value))
+	body := bytes.NewBuffer(make([]byte, 0, totalBody))
+	f := func(x interface{}) {
+		err := binary.Write(b, binary.BigEndian, x)
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	g := func(x interface{}) {
+		err := binary.Write(body, binary.BigEndian, x)
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	f(reqMagic) // magic
+	f(op)
+	f(uint16(len(item.Key))) // key length
+	f(extraLength)
+	f(byte(0x00)) // data type
+	f(uint16(0))  // status or vbucket
+	f(totalBody)  // total body
+	f(uint32(0))  // opaque
+	f(uint64(0))  // CAS
+	// extras
+	switch op {
+	case opSet:
+		g(item.Flags)
+		g(item.Expiration)
+	case opGet:
+		break
+	default:
+		panic("unsupported operation")
+	}
+	g([]byte(item.Key))
+	g(item.Value)
+	if b.Len() != int(headerSize) || body.Len() != int(totalBody) {
+		panic(fmt.Sprintf("wrong size, internal error, this is a bug, expected header %d got %d; expected body %d got %d", headerSize, b.Len(), totalBody, body.Len()))
+	}
+	if len(errs) > 0 {
+		return nil, errs[0] // return first
+	}
+	return body, nil
+}
+
+func (c *Client) binaryPopulate(conn io.ReadWriter, op byte, item *Item) (*Item, error) {
+	if !c.legalKey(item.Key) {
+		return nil, ErrMalformedKey
+	}
+	b := make([]byte, headerSize)
+	headerBuff := bytes.NewBuffer(b)
+	body, err := binaryRequest(headerBuff, op, item)
+	if err != nil {
+		return nil, err
+	}
+	_, err = conn.Write(headerBuff.Bytes())
+	if err != nil {
+		return nil, err
+	}
+	if body.Len() > 0 {
+		_, err = conn.Write(body.Bytes())
+		if err != nil {
+			return nil, err
+		}
+	}
+	return binaryResponse(b, conn, op)
+}
+
+// TODO maybe use an arena for the body buff
+func binaryResponse(headerBuff []byte, conn io.Reader, op byte) (*Item, error) {
+	_, err := io.ReadFull(conn, headerBuff)
+	if err != nil {
+		return nil, err
+	}
+
+	magic := headerBuff[0]
+	if magic != resMagic {
+		return nil, ErrWrongMagic
+	}
+	opCode := headerBuff[1]
+	if opCode != op {
+		return nil, ErrWrongOp
+	}
+	keyLen := int(binary.BigEndian.Uint16(headerBuff[2:4]))
+	extraLen := int(headerBuff[4])
+
+	status := binary.BigEndian.Uint16(headerBuff[6:8])
+	if status != statusSuccess {
+		return nil, &errBadStatus{op: status}
+	}
+
+	opaque := binary.BigEndian.Uint32(headerBuff[12:16])
+	cas := binary.BigEndian.Uint64(headerBuff[16:24])
+
+	bodyLen := int(binary.BigEndian.Uint32(headerBuff[8:12])) - (keyLen + extraLen)
+
+	buf := make([]byte, keyLen+extraLen+bodyLen)
+	_, err = io.ReadFull(conn, buf)
+	if err != nil {
+		return nil, err
+	}
+
+	responseItem := &Item{casid: cas, opaque: opaque}
+	if extraLen > 0 {
+		responseItem.extras = buf[0:extraLen]
+	}
+	if keyLen > 0 {
+		responseItem.Key = string(buf[extraLen : keyLen+extraLen])
+	}
+	if keyLen+extraLen > 0 {
+		responseItem.Value = buf[keyLen+extraLen:]
+	}
+
+	err = responseItem.validateResponse(op)
+	if err != nil {
+		return nil, err
+	}
+	return responseItem, nil
+}
+
+
+func (c *Client) writeItem(rw *bufio.ReadWriter, verb string, item *Item) error {
 	var err error
 	if verb == "cas" {
 		_, err = fmt.Fprintf(rw, "%s %s %d %d %d %d\r\n",
@@ -553,12 +837,20 @@ func (c *Client) populateOne(rw *bufio.ReadWriter, verb string, item *Item) erro
 	if _, err = rw.Write(item.Value); err != nil {
 		return err
 	}
-	if _, err := rw.Write(crlf); err != nil {
+	if _, err = rw.Write(crlf); err != nil {
 		return err
 	}
-	if err := rw.Flush(); err != nil {
+	if err = rw.Flush(); err != nil {
 		return err
 	}
+	return nil
+}
+
+func (c *Client) populateOne(rw *bufio.ReadWriter, verb string, item *Item) error {
+	if !c.legalKey(item.Key) {
+		return ErrMalformedKey
+	}
+	err := c.writeItem(rw, verb, item)
 	line, err := rw.ReadSlice('\n')
 	if err != nil {
 		return err
@@ -581,11 +873,10 @@ func writeReadLine(rw *bufio.ReadWriter, format string, args ...interface{}) ([]
 	if err != nil {
 		return nil, err
 	}
-	if err := rw.Flush(); err != nil {
+	if err = rw.Flush(); err != nil {
 		return nil, err
 	}
-	line, err := rw.ReadSlice('\n')
-	return line, err
+	return rw.ReadSlice('\n')
 }
 
 func writeExpectf(rw *bufio.ReadWriter, expect []byte, format string, args ...interface{}) error {
@@ -657,10 +948,7 @@ func (c *Client) incrDecr(verb, key string, delta uint64) (uint64, error) {
 			return errors.New("memcache: client error: " + string(errMsg))
 		}
 		val, err = strconv.ParseUint(string(line[:len(line)-2]), 10, 64)
-		if err != nil {
-			return err
-		}
-		return nil
+		return err
 	})
 	return val, err
 }

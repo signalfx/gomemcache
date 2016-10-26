@@ -25,7 +25,6 @@ import (
 
 // ServerSelector is the interface that selects a memcache server
 // as a function of the item's key.
-//
 // All ServerSelector implementations must be safe for concurrent use
 // by multiple goroutines.
 type ServerSelector interface {
@@ -96,6 +95,7 @@ var keyBufPool = sync.Pool{
 	},
 }
 
+// PickServer returns a server based on key
 func (ss *ServerList) PickServer(key string) (net.Addr, error) {
 	ss.mu.RLock()
 	defer ss.mu.RUnlock()

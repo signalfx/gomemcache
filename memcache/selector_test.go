@@ -16,7 +16,10 @@ limitations under the License.
 
 package memcache
 
-import "testing"
+import (
+	"github.com/signalfx/metricproxy/Godeps/_workspace/src/github.com/stretchr/testify/assert"
+	"testing"
+)
 
 func BenchmarkPickServer(b *testing.B) {
 	// at least two to avoid 0 and 1 special cases:
@@ -30,7 +33,7 @@ func BenchmarkPickServer_Single(b *testing.B) {
 func benchPickServer(b *testing.B, servers ...string) {
 	b.ReportAllocs()
 	var ss ServerList
-	ss.SetServers(servers...)
+	assert.NoError(b, ss.SetServers(servers...))
 	for i := 0; i < b.N; i++ {
 		if _, err := ss.PickServer("some key"); err != nil {
 			b.Fatal(err)
