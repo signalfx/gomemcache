@@ -18,6 +18,7 @@ limitations under the License.
 package memcache
 
 import (
+	"bytes"
 	"fmt"
 	"github.com/stretchr/testify/assert"
 	"net"
@@ -26,7 +27,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"bytes"
 )
 
 const testServer = "localhost:11211"
@@ -289,4 +289,20 @@ func testTouchWithClient(t *testing.T, c *Client) {
 			t.Fatalf("unexpected error retrieving bar: %v", err.Error())
 		}
 	}
+}
+
+func TestConnectionClosing(t *testing.T) {
+	ln, err := net.Listen("tcp", ":0")
+	assert.NoError(t, err)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			assert.NoError(t, err)
+			conn.Close()
+		}
+	}()
+	c := New(ln.Addr().String())
+	c.Binary = true
+	err = c.Set(&Item{Key: "key", Value: []byte("value")})
+	assert.Empty(t, c.freeconn)
 }
