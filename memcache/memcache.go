@@ -298,8 +298,8 @@ func (cn *conn) extendDeadline() error {
 // is nil (not an error) or is only a protocol level error (e.g. a
 // cache miss).  The purpose is to not recycle TCP connections that
 // are bad.
-func (cn *conn) condRelease(err error) {
-	if err == nil || resumableError(err) {
+func (cn *conn) condRelease(err *error) {
+	if *err == nil || resumableError(*err) {
 		cn.release()
 	} else {
 		_ = cn.nc.Close()
@@ -406,8 +406,8 @@ func (c *Client) onItem(item *Item, fn doer) (*Item, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer cn.condRelease(&err)
 	item, err = fn(cn, item)
-	cn.condRelease(err)
 	return item, err
 }
 
@@ -467,8 +467,8 @@ func (c *Client) withAddrRw(addr net.Addr, fn func(*bufio.ReadWriter) error) (er
 	if err != nil {
 		return err
 	}
+	defer cn.condRelease(&err)
 	err = fn(cn.rw)
-	cn.condRelease(err)
 	return err
 }
 
