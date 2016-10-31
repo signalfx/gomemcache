@@ -305,4 +305,6 @@ func TestConnectionClosing(t *testing.T) {
 	c.Binary = true
 	err = c.Set(&Item{Key: "key", Value: []byte("value")})
 	assert.Empty(t, c.freeconn)
+	_, err = c.Get("key")
+	assert.Empty(t, c.freeconn)
 }
