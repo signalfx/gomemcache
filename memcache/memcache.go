@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 
 	"encoding/binary"
@@ -78,7 +77,7 @@ func init() {
 }
 
 // Similar to:
-// http://code.google.com/appengine/docs/go/memcache/reference.html
+// https://godoc.org/google.golang.org/appengine/memcache
 
 var (
 	// ErrCacheMiss means that a Get failed because the item wasn't present.
@@ -138,15 +137,18 @@ func (e *errBadStatus) Error() string {
 	return "Bad status in response: " + statusNames[e.op]
 }
 
-// DefaultTimeout is the default socket read/write timeout.
-const DefaultTimeout = 100 * time.Millisecond
-
 const (
-	buffered            = 8 // arbitrary buffered channel size, for readability
-	maxIdleConnsPerAddr = 2 // TODO(bradfitz): make this configurable?
+	// DefaultTimeout is the default socket read/write timeout.
+	DefaultTimeout = 100 * time.Millisecond
+
+	// DefaultMaxIdleConns is the default maximum number of idle connections
+	// kept for any single address.
+	DefaultMaxIdleConns = 2
 )
 
 type doer func(*conn, *Item) (*Item, error)
+
+const buffered = 8 // arbitrary buffered channel size, for readability
 
 // resumableError returns true if err is only a protocol-level cache error.
 // This is used to determine whether or not a server connection should
@@ -166,7 +168,7 @@ func (c *Client) legalKey(key string) bool {
 	}
 	if !c.Binary {
 		for i := 0; i < len(key); i++ {
-			if key[i] <= ' ' || key[i] > 0x7e {
+			if key[i] <= ' ' || key[i] == 0x7f {
 				return false
 			}
 		}
@@ -215,6 +217,14 @@ type Client struct {
 	Timeout time.Duration
 	// determines which protocol is used, binary or plaintext
 	Binary bool
+
+	// MaxIdleConns specifies the maximum number of idle connections that will
+	// be maintained per address. If less than one, DefaultMaxIdleConns will be
+	// used.
+	//
+	// Consider your expected traffic rates and latency carefully. This should
+	// be set to a number higher than your peak parallel requests.
+	MaxIdleConns int
 
 	selector ServerSelector
 
@@ -313,8 +323,8 @@ func (c *Client) putFreeConn(addr fmt.Stringer, cn *conn) {
 		c.freeconn = make(map[string][]*conn)
 	}
 	freelist := c.freeconn[addr.String()]
-	if len(freelist) >= maxIdleConnsPerAddr {
-		_ = cn.nc.Close()
+	if len(freelist) >= c.maxIdleConns() {
+		cn.nc.Close()
 		return
 	}
 	c.freeconn[addr.String()] = append(freelist, cn)
@@ -340,6 +350,13 @@ func (c *Client) netTimeout() time.Duration {
 		return c.Timeout
 	}
 	return DefaultTimeout
+}
+
+func (c *Client) maxIdleConns() int {
+	if c.MaxIdleConns > 0 {
+		return c.MaxIdleConns
+	}
+	return DefaultMaxIdleConns
 }
 
 // ConnectTimeoutError is the error type used when it takes
@@ -443,8 +460,9 @@ func (c *Client) get(cn *conn, item *Item) (*Item, error) {
 
 // Touch updates the expiry for the given key. The seconds parameter is either
 // a Unix timestamp or, if seconds is less than 1 month, the number of seconds
-// into the future at which time the item will expire. ErrCacheMiss is returned if the
-// key is not in the cache. The key must be at most 250 bytes in length.
+// into the future at which time the item will expire. Zero means the item has
+// no expiration time. ErrCacheMiss is returned if the key is not in the cache.
+// The key must be at most 250 bytes in length.
 func (c *Client) Touch(key string, seconds int32) (err error) {
 	return c.withKeyAddr(key, func(addr net.Addr) error {
 		return c.touchFromAddr(addr, []string{key}, seconds)
@@ -605,11 +623,14 @@ func parseGetResponse(r *bufio.Reader, cb func(*Item)) error {
 		if err != nil {
 			return err
 		}
-		it.Value, err = ioutil.ReadAll(io.LimitReader(r, int64(size)+2))
+		it.Value = make([]byte, size+2)
+		_, err = io.ReadFull(r, it.Value)
 		if err != nil {
+			it.Value = nil
 			return err
 		}
 		if !bytes.HasSuffix(it.Value, crlf) {
+			it.Value = nil
 			return fmt.Errorf("memcache: corrupt get result read")
 		}
 		it.Value = it.Value[:size]
