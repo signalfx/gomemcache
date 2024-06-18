@@ -132,7 +132,7 @@ func doSetGetAdd(t *testing.T, c *Client) {
 	if err != ErrMalformedKey {
 		t.Errorf("set(foo bar) should return ErrMalformedKey instead of %v", err)
 	}
-	malFormed = &Item{Key: "foo" + string(0x7f), Value: []byte("foobarval")}
+	malFormed = &Item{Key: "foo" + string(rune(0x7f)), Value: []byte("foobarval")}
 	err = c.Set(malFormed)
 	if err != ErrMalformedKey {
 		t.Errorf("set(foo<0x7f>) should return ErrMalformedKey instead of %v", err)
@@ -270,6 +270,9 @@ func testBinary(t *testing.T, c *Client) {
 	assert.Equal(t, ErrUnsupported, err)
 	_, err = c.Decrement("key", uint64(1))
 	assert.Equal(t, ErrUnsupported, err)
+
+	err = c.Close()
+	assert.NoError(t, err)
 }
 
 func testTouchWithClient(t *testing.T, c *Client) {
